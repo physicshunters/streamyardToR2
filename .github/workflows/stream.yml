@@ -1,0 +1,46 @@
+name: StreamYard Replicator
+
+on:
+  workflow_dispatch:
+    inputs:
+      watch_url:
+        description: 'StreamYard Watch Link'
+        required: true
+        type: string
+      stream_slug:
+        description: 'Stream Slug Name'
+        required: true
+        type: string
+
+  repository_dispatch:
+    types: [start_stream]
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install boto3 requests urllib3 playwright
+          playwright install chromium
+          playwright install-deps
+
+      - name: Run Stream Replicator
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          CUSTOM_STREAM_DOMAIN: ${{ secrets.CUSTOM_STREAM_DOMAIN }}
+        run: |
+          URL="${{ github.event.inputs.watch_url || github.event.client_payload.watch_url }}"
+          SLUG="${{ github.event.inputs.stream_slug || github.event.client_payload.stream_slug }}"
+          python stream_mirror.py --url "$URL" --slug "$SLUG"
