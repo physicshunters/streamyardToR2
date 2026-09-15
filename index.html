@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamYard to R2 Stream Controller</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 100%; max-width: 480px; }
+        h2 { margin-top: 0; color: #38bdf8; text-align: center; }
+        label { font-size: 14px; font-weight: 600; margin-top: 15px; display: block; color: #94a3b8; }
+        input, select { width: 100%; padding: 12px; margin-top: 6px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 14px; }
+        input:focus, select:focus { border-color: #38bdf8; outline: none; }
+        button { width: 100%; margin-top: 20px; padding: 12px; background: #0284c7; border: none; border-radius: 6px; color: white; font-size: 16px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #0369a1; }
+        .status { margin-top: 20px; padding: 12px; border-radius: 6px; display: none; font-size: 13px; word-break: break-all; }
+        .success { background: #064e3b; color: #6ee7b7; border: 1px solid #047857; }
+        .error { background: #7f1d1d; color: #fca5a5; border: 1px solid #b91c1c; }
+        .link-box { margin-top: 10px; background: #0f172a; padding: 10px; border-radius: 6px; border: 1px dashed #38bdf8; font-family: monospace; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>🚀 Stream Controller</h2>
+    
+    <label for="githubPat">GitHub Access Token (PAT)</label>
+    <input type="password" id="githubPat" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx">
+
+    <label for="repoSelect">Repository Select</label>
+    <select id="repoSelect">
+        <option value="physicshunters/streamyardToR2">Repo 1 (streamyardToR2)</option>
+        <option value="physicshunters/stream-bot-2">Repo 2 (stream-bot-2)</option>
+        <option value="physicshunters/stream-bot-3">Repo 3 (stream-bot-3)</option>
+    </select>
+
+    <label for="watchUrl">StreamYard Watch Link</label>
+    <input type="text" id="watchUrl" placeholder="https://streamyard.com/watch/xxxx">
+
+    <label for="streamSlug">Stream Slug Name</label>
+    <input type="text" id="streamSlug" placeholder="physics_live_01">
+
+    <button onclick="triggerStream()" id="submitBtn">Start Mirroring</button>
+
+    <div id="statusBox" class="status"></div>
+</div>
+
+<script>
+    // LocalStorage থেকে টোকেন লোড করা
+    document.addEventListener("DOMContentLoaded", () => {
+        const savedPat = localStorage.getItem("github_pat");
+        if (savedPat) {
+            document.getElementById("githubPat").value = savedPat;
+        }
+    });
+
+    async function triggerStream() {
+        const pat = document.getElementById("githubPat").value.trim();
+        const repo = document.getElementById("repoSelect").value;
+        const watchUrl = document.getElementById("watchUrl").value.trim();
+        const streamSlug = document.getElementById("streamSlug").value.trim();
+        const statusBox = document.getElementById("statusBox");
+        const btn = document.getElementById("submitBtn");
+
+        if (!pat || !watchUrl || !streamSlug) {
+            showStatus("সবগুলো ঘর সঠিকভাবে পূরণ করুন!", "error");
+            return;
+        }
+
+        // ব্রাউজারে PAT সেভ করে রাখা
+        localStorage.setItem("github_pat", pat);
+
+        btn.innerText = "Triggering...";
+        btn.disabled = true;
+        statusBox.style.display = "none";
+
+        const endpoint = `https://api.github.com/repos/${repo}/dispatches`;
+
+        try {
+            const response = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    "Authorization": `token ${pat}`,
+                    "Accept": "application/vnd.github.v3+json",
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    event_type: "start_stream",
+                    client_payload: {
+                        watch_url: watchUrl,
+                        stream_slug: streamSlug
+                    }
+                })
+            });
+
+            if (response.status === 2400 || response.status === 204) {
+                const playerUrl = `https://stream.phyhunt.org/live/${streamSlug}/master.m3u8`;
+                showStatus(
+                    `✅ Stream Triggered Successfully!<br><br><b>Player Link:</b><div class="link-box">${playerUrl}</div>`, 
+                    "success"
+                );
+            } else {
+                const errData = await response.json().catch(() => ({}));
+                showStatus(`❌ Error (${response.status}): ${errData.message || 'Unauthorized or Wrong Repo'}`, "error");
+            }
+        } catch (err) {
+            showStatus(`❌ Request failed: ${err.message}`, "error");
+        } finally {
+            btn.innerText = "Start Mirroring";
+            btn.disabled = false;
+        }
+    }
+
+    function showStatus(msg, type) {
+        const statusBox = document.getElementById("statusBox");
+        statusBox.className = `status ${type}`;
+        statusBox.innerHTML = msg;
+        statusBox.style.display = "block";
+    }
+</script>
+
+</body>
+</html>
