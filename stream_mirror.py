@@ -96,10 +96,12 @@ async def get_streamyard_id(watch_url):
 
         def handle_request(request):
             nonlocal stream_id
-            if "streamyard-video-delivery.global.ssl.fastly.net/live/" in request.url:
-                match = re.search(r'/live/([^/]+)/', request.url)
+            url = request.url
+            if "streamyard-video-delivery.global.ssl.fastly.net/live/" in url:
+                match = re.search(r'/live/([^/]+)', url)
                 if match:
-                    stream_id = match.group(1)
+                    # Clean Stream ID extraction
+                    stream_id = match.group(1).split('/')[0].split('?')[0]
 
         page.on("request", handle_request)
         try:
@@ -126,24 +128,24 @@ def process_live_stream(live_url, stream_slug):
     uploader_thread = threading.Thread(target=r2_live_uploader, args=(local_hls_dir, r2_folder, stop_event))
     uploader_thread.start()
 
-    # 🔄 FFmpeg Auto-Restart Loop Configuration
     max_retries = 15
     retry_count = 0
     
+    # Hide annoying ffmpeg logs but keep errors
     cmd = [
-        "ffmpeg", "-re",
+        "ffmpeg", "-loglevel", "error", "-re",
         "-i", live_url,
         "-filter_complex",
         "[0:v]split=2[v1][v2];"
         "[v1]scale=w=1280:h=720[v720];"
         "[v2]scale=w=640:h=360[v360]",
 
-        # 720p - CPU (libx264)
+        # 720p Output
         "-map", "[v720]", "-map", "0:a?",
         "-c:v:0", "libx264", "-preset", "ultrafast",
         "-b:v:0", "2500k", "-g", "120",
 
-        # 360p - CPU (libx264)
+        # 360p Output
         "-map", "[v360]", "-map", "0:a?",
         "-c:v:1", "libx264", "-preset", "ultrafast",
         "-b:v:1", "800k", "-g", "120",
@@ -154,7 +156,7 @@ def process_live_stream(live_url, stream_slug):
         "-hls_time", "4",
         "-hls_list_size", "0",
         "-hls_playlist_type", "event",
-        "-hls_flags", "temp_file+append_list",  # 👈 Added 'append_list' to continue playlist seamlessly
+        "-hls_flags", "temp_file+append_list",
         "-master_pl_name", "master.m3u8",
         "-var_stream_map", "v:0,a:0,name:720p v:1,a:1,name:360p",
         os.path.join(local_hls_dir, "stream_%v.m3u8")
@@ -166,7 +168,6 @@ def process_live_stream(live_url, stream_slug):
                 print(f"🔄 Attempting to reconnect FFmpeg (Retry {retry_count}/{max_retries})...")
             
             subprocess.run(cmd, check=True)
-            # If FFmpeg exits normally (Live stream ends successfully), break the loop
             print("🏁 FFmpeg finished normally. Stream ended by host.")
             break
 
@@ -183,7 +184,6 @@ def process_live_stream(live_url, stream_slug):
             print(f"❌ Unexpected FFmpeg Error: {e}")
             break
 
-    # Finalization phase
     print("\n🧹 Live Ended! Finalizing M3U8 files...")
     time.sleep(3)
 
@@ -205,12 +205,13 @@ if __name__ == "__main__":
     parser.add_argument("--slug", required=True)
     args = parser.parse_args()
 
-    # Step 1: Detect Stream ID from Watch URL
     stream_id = asyncio.run(get_streamyard_id(args.url))
 
-    # Step 2: Stream ID পেলে FFmpeg ট্রান্সকোডিং চালুকরণ
     if stream_id:
-        fastly_m3u8_url = f"https://fastly.net{stream_id}/stream_720p.m3u8"
+        # Fixed Full Domain URL
+        fastly_m3u8_url = f"https://streamyard-video-delivery.global.ssl.fastly.net/live/{stream_id}/stream_720p.m3u8"
+        print(f"🎯 Target Acquired: {stream_id}")
+        print(f"📡 Transcoding URL: {fastly_m3u8_url}")
         process_live_stream(fastly_m3u8_url, args.slug)
     else:
         print("❌ Stream ID পাওয়া যায়নি।")
