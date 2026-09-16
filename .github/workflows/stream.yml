@@ -27,22 +27,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      # static FFmpeg (apt install ছাড়া সরাসরি 5 সেকেন্ডে ডাউনলোড ও সেটআপ)
-      - name: Setup Static FFmpeg
+      # Stable official FFmpeg package (No Segfault)
+      - name: Install FFmpeg
         run: |
-          wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-          tar -xf ffmpeg-release-amd64-static.tar.xz
-          sudo mv ffmpeg-*-static/ffmpeg /usr/local/bin/
-          rm -rf ffmpeg-*-static*
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
 
-      # Playwright Browser Cache
       - name: Cache Playwright Browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('**/stream_mirror.py') }}
 
-      # Fast Pip & Minimal Browser Install
       - name: Install Dependencies
         run: |
           pip install boto3 requests urllib3 playwright
