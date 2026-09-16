@@ -27,17 +27,26 @@ jobs:
         with:
           python-version: '3.11'
 
+      # static FFmpeg (apt install ছাড়া সরাসরি 5 সেকেন্ডে ডাউনলোড ও সেটআপ)
+      - name: Setup Static FFmpeg
+        run: |
+          wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          tar -xf ffmpeg-release-amd64-static.tar.xz
+          sudo mv ffmpeg-*-static/ffmpeg /usr/local/bin/
+          rm -rf ffmpeg-*-static*
+
+      # Playwright Browser Cache
       - name: Cache Playwright Browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('**/stream_mirror.py') }}
 
+      # Fast Pip & Minimal Browser Install
       - name: Install Dependencies
         run: |
           pip install boto3 requests urllib3 playwright
           playwright install chromium
-          playwright install-deps
 
       - name: Run Stream Replicator
         env:
