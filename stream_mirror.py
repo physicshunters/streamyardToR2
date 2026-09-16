@@ -3,22 +3,22 @@ import re
 import time
 import asyncio
 import argparse
+import subprocess
 import threading
-from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from playwright.async_api import async_playwright
 
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
-R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-CUSTOM_STREAM_DOMAIN = os.getenv("CUSTOM_STREAM_DOMAIN")
+# ─────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "YOUR_R2_ACCOUNT_ID")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "YOUR_R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "YOUR_R2_SECRET_KEY")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "YOUR_R2_BUCKET_NAME")
+CUSTOM_STREAM_DOMAIN = os.getenv("CUSTOM_STREAM_DOMAIN", "https://stream.phyhunt.org")
 
 boto_config = Config(max_pool_connections=50, retries={'max_attempts': 3})
 s3 = boto3.client(
@@ -30,141 +30,60 @@ s3 = boto3.client(
     config=boto_config
 )
 
-def get_fast_session():
-    s = requests.Session()
-    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=Retry(total=3, backoff_factor=0.2))
-    s.mount('https://', adapter)
-    s.mount('http://', adapter)
-    s.headers.update({"User-Agent": "Mozilla/5.0"})
-    return s
-
-# ─────────────────────────────────────────────────────────
-# FIX 1: v2 Code-এর মতো নিখুঁত Cache-Control Header
-# ─────────────────────────────────────────────────────────
-def upload_bytes(data, r2_key, content_type, is_m3u8=False, is_final=False):
+def upload_to_r2(local_path, r2_key, content_type, is_m3u8=False, is_final=False):
     extra_args = {'ContentType': content_type}
     if is_m3u8:
         if is_final:
             extra_args['CacheControl'] = 'public, max-age=2592000, s-maxage=2592000'
         else:
-            # v2 এর মতো exact 2s cache-control (স্টেবল প্লেব্যাকের জন্য)
             extra_args['CacheControl'] = 'public, max-age=2, s-maxage=2, must-revalidate'
     else:
         extra_args['CacheControl'] = 'public, max-age=86400, s-maxage=86400'
 
     try:
-        s3.put_object(Bucket=R2_BUCKET_NAME, Key=r2_key, Body=data, **extra_args)
+        s3.upload_file(local_path, R2_BUCKET_NAME, r2_key, ExtraArgs=extra_args)
     except Exception as e:
-        print(f"\n❌ Upload Failed: {r2_key} - {e}")
+        print(f"❌ Upload Failed for {r2_key}: {e}")
 
-def create_master_playlist(r2_folder):
-    master_content = (
-        "#EXTM3U\n"
-        "#EXT-X-VERSION:3\n"
-        "#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n"
-        "720p/index.m3u8\n"
-        "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n"
-        "360p/index.m3u8\n"
-    )
-    upload_bytes(master_content.encode('utf-8'), f"{r2_folder}/master.m3u8", 'application/vnd.apple.mpegurl', is_m3u8=True, is_final=True)
+def r2_live_uploader(local_dir, r2_folder, stop_event):
+    uploaded_ts_files = set()
+    last_m3u8_mtime = {}
 
-def fetch_and_pipe_ts(ts_url, r2_key, session):
-    try:
-        res = session.get(ts_url, timeout=3)
-        if res.status_code == 200:
-            upload_bytes(res.content, r2_key, 'video/MP2T')
-    except Exception:
-        pass
-
-# ─────────────────────────────────────────────────────────
-# FIX 2: M3U8-এ Target Duration ও Sequence নাম্বার ঠিক করা
-# ─────────────────────────────────────────────────────────
-def mirror_stream_worker(stream_url, quality, r2_base_folder, stop_event):
-    session = get_fast_session()
-    uploaded_segments = set()
-    all_seen_manifest = {}
-    target_folder = f"{r2_base_folder}/{quality}"
+    print("🚀 CPU Uploader Watchdog Started (20 Threads)...")
 
     with ThreadPoolExecutor(max_workers=20) as executor:
         while not stop_event.is_set():
-            try:
-                res = session.get(stream_url, timeout=2)
-                if res.status_code != 200:
-                    time.sleep(0.5)
-                    continue
+            if not os.path.exists(local_dir):
+                time.sleep(0.5)
+                continue
 
-                lines = res.text.splitlines()
-                current_duration = 4.0
-                updated_live = False
+            files = os.listdir(local_dir)
 
-                for line in lines:
-                    line_clean = line.strip()
-                    if line_clean.startswith("#EXTINF:"):
-                        try:
-                            current_duration = float(line_clean.split(":")[1].split(",")[0])
-                        except Exception:
-                            current_duration = 4.0
-                    elif line_clean and not line_clean.startswith("#") and ".ts" in line_clean:
-                        ts_name = line_clean.split("?")[0].split("/")[-1]
-                        
-                        if ts_name not in all_seen_manifest:
-                            all_seen_manifest[ts_name] = current_duration
+            ts_files = [f for f in files if f.endswith('.ts')]
+            for ts in ts_files:
+                if ts not in uploaded_ts_files and not ts.endswith('.tmp'):
+                    uploaded_ts_files.add(ts)
+                    local_path = os.path.join(local_dir, ts)
+                    r2_key = f"{r2_folder}/{ts}"
+                    executor.submit(upload_to_r2, local_path, r2_key, 'video/MP2T', False)
 
-                        if ts_name not in uploaded_segments:
-                            uploaded_segments.add(ts_name)
-                            updated_live = True
-                            ts_full_url = urljoin(stream_url, line_clean)
-                            r2_key = f"{target_folder}/{ts_name}"
-                            executor.submit(fetch_and_pipe_ts, ts_full_url, r2_key, session)
+            m3u8_files = [f for f in files if f.endswith('.m3u8') and not f.endswith('.tmp')]
+            for m3u8 in m3u8_files:
+                local_path = os.path.join(local_dir, m3u8)
+                try:
+                    current_mtime = os.path.getmtime(local_path)
+                    if current_mtime != last_m3u8_mtime.get(m3u8):
+                        last_m3u8_mtime[m3u8] = current_mtime
+                        r2_key = f"{r2_folder}/{m3u8}"
+                        executor.submit(upload_to_r2, local_path, r2_key, 'application/vnd.apple.mpegurl', True, False)
+                except FileNotFoundError:
+                    pass
 
-                if updated_live:
-                    live_lines = [
-                        "#EXTM3U\n",
-                        "#EXT-X-VERSION:3\n",
-                        "#EXT-X-TARGETDURATION:6\n",
-                        "#EXT-X-MEDIA-SEQUENCE:0\n",
-                        "#EXT-X-PLAYLIST-TYPE:EVENT\n"
-                    ]
-                    
-                    sorted_ts = sorted(
-                        all_seen_manifest.keys(),
-                        key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else x
-                    )
-                    
-                    for ts in sorted_ts:
-                        dur = all_seen_manifest[ts]
-                        live_lines.append(f"#EXTINF:{dur:.6f},\n{ts}\n")
-
-                    upload_bytes("".join(live_lines).encode('utf-8'), f"{target_folder}/index.m3u8", 'application/vnd.apple.mpegurl', is_m3u8=True)
-
-                if "#EXT-X-ENDLIST" in res.text:
-                    break
-
-            except Exception:
-                pass
-
+            uploaded_ts_files.intersection_update(ts_files)
             time.sleep(0.5)
 
-    vod_lines = [
-        "#EXTM3U\n",
-        "#EXT-X-VERSION:3\n",
-        "#EXT-X-TARGETDURATION:6\n",
-        "#EXT-X-MEDIA-SEQUENCE:0\n",
-        "#EXT-X-PLAYLIST-TYPE:VOD\n"
-    ]
-    sorted_ts = sorted(
-        all_seen_manifest.keys(),
-        key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else x
-    )
-    for ts in sorted_ts:
-        dur = all_seen_manifest[ts]
-        vod_lines.append(f"#EXTINF:{dur:.6f},\n{ts}\n")
-    vod_lines.append("#EXT-X-ENDLIST\n")
-
-    upload_bytes("".join(vod_lines).encode('utf-8'), f"{target_folder}/index.m3u8", 'application/vnd.apple.mpegurl', is_m3u8=True, is_final=True)
-
 async def get_streamyard_id(watch_url):
-    print(f"🚀 Launching Detector for Watch Link: {watch_url}")
+    print(f"🚀 Launching Playwright Detector for Watch Link: {watch_url}")
     stream_id = None
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
@@ -191,24 +110,69 @@ async def get_streamyard_id(watch_url):
         await browser.close()
         return stream_id
 
-def run_mirror(stream_id, stream_slug, r2_base_folder):
-    base_url = f"https://streamyard-video-delivery.global.ssl.fastly.net/live/{stream_id}"
-    streams_dict = {
-        "720p": f"{base_url}/stream_720p.m3u8",
-        "360p": f"{base_url}/stream_360p.m3u8"
-    }
+def process_live_stream(live_url, stream_slug):
+    local_hls_dir = f"live_{stream_slug}"
+    r2_folder = f"live/{stream_slug}"
+    os.makedirs(local_hls_dir, exist_ok=True)
 
-    print(f"\n🚀 Stream Replicator Started | Stream ID: {stream_id}")
-    print(f"🔗 Audience Link: {CUSTOM_STREAM_DOMAIN}/{r2_base_folder}/master.m3u8\n")
+    print(f"\n📡 Starting FFmpeg CPU Transcoding for: {stream_slug}")
+    print(f"🔗 Audience Link: {CUSTOM_STREAM_DOMAIN}/{r2_folder}/master.m3u8\n")
 
     stop_event = threading.Event()
-    workers = []
-    for quality, url in streams_dict.items():
-        t = threading.Thread(target=mirror_stream_worker, args=(url, quality, r2_base_folder, stop_event))
-        workers.append(t)
-        t.start()
-    for t in workers:
-        t.join()
+    uploader_thread = threading.Thread(target=r2_live_uploader, args=(local_hls_dir, r2_folder, stop_event))
+    uploader_thread.start()
+
+    try:
+        cmd = [
+            "ffmpeg", "-re",
+            "-i", live_url,
+            "-filter_complex",
+            "[0:v]split=2[v1][v2];"
+            "[v1]scale=w=1280:h=720[v720];"
+            "[v2]scale=w=640:h=360[v360]",
+
+            # 720p - CPU (libx264)
+            "-map", "[v720]", "-map", "0:a?",
+            "-c:v:0", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-b:v:0", "2500k", "-g", "180",
+
+            # 360p - CPU (libx264)
+            "-map", "[v360]", "-map", "0:a?",
+            "-c:v:1", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-b:v:1", "800k", "-g", "180",
+
+            "-c:a", "aac", "-b:a", "128k",
+
+            "-f", "hls",
+            "-hls_time", "6",
+            "-hls_list_size", "0",
+            "-hls_playlist_type", "event",
+            "-hls_flags", "temp_file",
+            "-master_pl_name", "master.m3u8",
+            "-var_stream_map", "v:0,a:0,name:720p v:1,a:1,name:360p",
+            os.path.join(local_hls_dir, "stream_%v.m3u8")
+        ]
+        subprocess.run(cmd, check=True)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Manual Stop (Ctrl+C) Triggered.")
+    except Exception as e:
+        print(f"\n❌ FFmpeg Error: {e}")
+    finally:
+        print("\n🧹 Live Ended! Finalizing M3U8 files...")
+        time.sleep(3)
+
+        stop_event.set()
+        uploader_thread.join()
+
+        print("🔄 Converting Live to VOD...")
+        m3u8_files = [f for f in os.listdir(local_hls_dir) if f.endswith('.m3u8')]
+        for m3u8 in m3u8_files:
+            local_path = os.path.join(local_hls_dir, m3u8)
+            r2_key = f"{r2_folder}/{m3u8}"
+            upload_to_r2(local_path, r2_key, 'application/vnd.apple.mpegurl', is_m3u8=True, is_final=True)
+
+        print("✅ VOD Conversion Complete!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -216,13 +180,12 @@ if __name__ == "__main__":
     parser.add_argument("--slug", required=True)
     args = parser.parse_args()
 
-    r2_base_folder = f"live/{args.slug}"
-    print(f"📌 Pre-creating Master Playlist for: {args.slug}")
-    create_master_playlist(r2_base_folder)
-
+    # Step 1: Detect Stream ID from Watch URL
     stream_id = asyncio.run(get_streamyard_id(args.url))
+
+    # Step 2: Stream ID পেলে FFmpeg ট্রান্সকোডিং চালুকরণ
     if stream_id:
-        print(f"🎯 Target Acquired: {stream_id}")
-        run_mirror(stream_id, args.slug, r2_base_folder)
+        fastly_m3u8_url = f"https://streamyard-video-delivery.global.ssl.fastly.net/live/{stream_id}/stream_720p.m3u8"
+        process_live_stream(fastly_m3u8_url, args.slug)
     else:
         print("❌ Stream ID পাওয়া যায়নি।")
