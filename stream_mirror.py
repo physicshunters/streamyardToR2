@@ -133,18 +133,18 @@ def process_live_stream(live_url, stream_slug):
 
             # 720p - CPU (libx264)
             "-map", "[v720]", "-map", "0:a?",
-            "-c:v:0", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-b:v:0", "2500k", "-g", "180",
+            "-c:v:0", "libx264", "-preset", "ultrafast",
+            "-b:v:0", "2500k", "-g", "120",
 
             # 360p - CPU (libx264)
             "-map", "[v360]", "-map", "0:a?",
-            "-c:v:1", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-b:v:1", "800k", "-g", "180",
+            "-c:v:1", "libx264", "-preset", "ultrafast",
+            "-b:v:1", "800k", "-g", "120",
 
             "-c:a", "aac", "-b:a", "128k",
 
             "-f", "hls",
-            "-hls_time", "6",
+            "-hls_time", "4",
             "-hls_list_size", "0",
             "-hls_playlist_type", "event",
             "-hls_flags", "temp_file",
