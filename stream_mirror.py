@@ -14,14 +14,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from playwright.async_api import async_playwright
 
-# GitHub Secrets থেকে ভ্যালু পড়া
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 CUSTOM_STREAM_DOMAIN = os.getenv("CUSTOM_STREAM_DOMAIN")
 
-boto_config = Config(max_pool_connections=100, retries={'max_attempts': 3, 'mode': 'standard'})
+boto_config = Config(max_pool_connections=50, retries={'max_attempts': 3})
 s3 = boto3.client(
     service_name='s3',
     endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -39,12 +38,20 @@ def get_fast_session():
     s.headers.update({"User-Agent": "Mozilla/5.0"})
     return s
 
+# ─────────────────────────────────────────────────────────
+# FIX 1: v2 Code-এর মতো নিখুঁত Cache-Control Header
+# ─────────────────────────────────────────────────────────
 def upload_bytes(data, r2_key, content_type, is_m3u8=False, is_final=False):
     extra_args = {'ContentType': content_type}
     if is_m3u8:
-        extra_args['CacheControl'] = 'public, max-age=2592000, s-maxage=2592000' if is_final else 'public, max-age=1, s-maxage=1, must-revalidate'
+        if is_final:
+            extra_args['CacheControl'] = 'public, max-age=2592000, s-maxage=2592000'
+        else:
+            # v2 এর মতো exact 2s cache-control (স্টেবল প্লেব্যাকের জন্য)
+            extra_args['CacheControl'] = 'public, max-age=2, s-maxage=2, must-revalidate'
     else:
         extra_args['CacheControl'] = 'public, max-age=86400, s-maxage=86400'
+
     try:
         s3.put_object(Bucket=R2_BUCKET_NAME, Key=r2_key, Body=data, **extra_args)
     except Exception as e:
@@ -61,7 +68,7 @@ def create_master_playlist(r2_folder):
     )
     upload_bytes(master_content.encode('utf-8'), f"{r2_folder}/master.m3u8", 'application/vnd.apple.mpegurl', is_m3u8=True, is_final=True)
 
-def fetch_and_pipe_ts(ts_url, r2_key, quality, duration, session):
+def fetch_and_pipe_ts(ts_url, r2_key, session):
     try:
         res = session.get(ts_url, timeout=3)
         if res.status_code == 200:
@@ -69,22 +76,25 @@ def fetch_and_pipe_ts(ts_url, r2_key, quality, duration, session):
     except Exception:
         pass
 
+# ─────────────────────────────────────────────────────────
+# FIX 2: M3U8-এ Target Duration ও Sequence নাম্বার ঠিক করা
+# ─────────────────────────────────────────────────────────
 def mirror_stream_worker(stream_url, quality, r2_base_folder, stop_event):
     session = get_fast_session()
     uploaded_segments = set()
     all_seen_manifest = {}
     target_folder = f"{r2_base_folder}/{quality}"
 
-    with ThreadPoolExecutor(max_workers=25) as executor:
+    with ThreadPoolExecutor(max_workers=20) as executor:
         while not stop_event.is_set():
             try:
                 res = session.get(stream_url, timeout=2)
                 if res.status_code != 200:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     continue
 
                 lines = res.text.splitlines()
-                current_duration = 2.0
+                current_duration = 4.0
                 updated_live = False
 
                 for line in lines:
@@ -93,9 +103,10 @@ def mirror_stream_worker(stream_url, quality, r2_base_folder, stop_event):
                         try:
                             current_duration = float(line_clean.split(":")[1].split(",")[0])
                         except Exception:
-                            current_duration = 2.0
+                            current_duration = 4.0
                     elif line_clean and not line_clean.startswith("#") and ".ts" in line_clean:
                         ts_name = line_clean.split("?")[0].split("/")[-1]
+                        
                         if ts_name not in all_seen_manifest:
                             all_seen_manifest[ts_name] = current_duration
 
@@ -104,30 +115,56 @@ def mirror_stream_worker(stream_url, quality, r2_base_folder, stop_event):
                             updated_live = True
                             ts_full_url = urljoin(stream_url, line_clean)
                             r2_key = f"{target_folder}/{ts_name}"
-                            executor.submit(fetch_and_pipe_ts, ts_full_url, r2_key, quality, current_duration, session)
+                            executor.submit(fetch_and_pipe_ts, ts_full_url, r2_key, session)
 
                 if updated_live:
-                    live_lines = ["#EXTM3U\n", "#EXT-X-VERSION:3\n", "#EXT-X-TARGETDURATION:6\n", "#EXT-X-PLAYLIST-TYPE:EVENT\n"]
-                    sorted_ts = sorted(all_seen_manifest.keys(), key=lambda x: int(x.split("_")[-1].replace(".ts", "")) if x.split("_")[-1].replace(".ts", "").isdigit() else x)
+                    live_lines = [
+                        "#EXTM3U\n",
+                        "#EXT-X-VERSION:3\n",
+                        "#EXT-X-TARGETDURATION:6\n",
+                        "#EXT-X-MEDIA-SEQUENCE:0\n",
+                        "#EXT-X-PLAYLIST-TYPE:EVENT\n"
+                    ]
+                    
+                    sorted_ts = sorted(
+                        all_seen_manifest.keys(),
+                        key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else x
+                    )
+                    
                     for ts in sorted_ts:
-                        live_lines.append(f"#EXTINF:{all_seen_manifest[ts]:.6f},\n{ts}\n")
+                        dur = all_seen_manifest[ts]
+                        live_lines.append(f"#EXTINF:{dur:.6f},\n{ts}\n")
+
                     upload_bytes("".join(live_lines).encode('utf-8'), f"{target_folder}/index.m3u8", 'application/vnd.apple.mpegurl', is_m3u8=True)
 
                 if "#EXT-X-ENDLIST" in res.text:
                     break
+
             except Exception:
                 pass
-            time.sleep(0.3)
 
-    vod_lines = ["#EXTM3U\n", "#EXT-X-VERSION:3\n", "#EXT-X-TARGETDURATION:6\n", "#EXT-X-PLAYLIST-TYPE:VOD\n"]
-    sorted_ts = sorted(all_seen_manifest.keys(), key=lambda x: int(x.split("_")[-1].replace(".ts", "")) if x.split("_")[-1].replace(".ts", "").isdigit() else x)
+            time.sleep(0.5)
+
+    vod_lines = [
+        "#EXTM3U\n",
+        "#EXT-X-VERSION:3\n",
+        "#EXT-X-TARGETDURATION:6\n",
+        "#EXT-X-MEDIA-SEQUENCE:0\n",
+        "#EXT-X-PLAYLIST-TYPE:VOD\n"
+    ]
+    sorted_ts = sorted(
+        all_seen_manifest.keys(),
+        key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else x
+    )
     for ts in sorted_ts:
-        vod_lines.append(f"#EXTINF:{all_seen_manifest[ts]:.6f},\n{ts}\n")
+        dur = all_seen_manifest[ts]
+        vod_lines.append(f"#EXTINF:{dur:.6f},\n{ts}\n")
     vod_lines.append("#EXT-X-ENDLIST\n")
+
     upload_bytes("".join(vod_lines).encode('utf-8'), f"{target_folder}/index.m3u8", 'application/vnd.apple.mpegurl', is_m3u8=True, is_final=True)
 
 async def get_streamyard_id(watch_url):
-    print(f"🚀 Launching Detector for: {watch_url}")
+    print(f"🚀 Launching Detector for Watch Link: {watch_url}")
     stream_id = None
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
@@ -160,6 +197,7 @@ def run_mirror(stream_id, stream_slug, r2_base_folder):
         "720p": f"{base_url}/stream_720p.m3u8",
         "360p": f"{base_url}/stream_360p.m3u8"
     }
+
     print(f"\n🚀 Stream Replicator Started | Stream ID: {stream_id}")
     print(f"🔗 Audience Link: {CUSTOM_STREAM_DOMAIN}/{r2_base_folder}/master.m3u8\n")
 
