@@ -38,7 +38,7 @@ def upload_to_r2(local_path, r2_key, content_type, is_m3u8=False, is_final=False
         else:
             extra_args['CacheControl'] = 'public, max-age=2, s-maxage=2, must-revalidate'
     else:
-        extra_args['CacheControl'] = 'public, max-age=86400, s-maxage=86400'
+        extra_args['CacheControl'] = 'public, max-age=2592000, s-maxage=2592000'
 
     try:
         s3.upload_file(local_path, R2_BUCKET_NAME, r2_key, ExtraArgs=extra_args)
