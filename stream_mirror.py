@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+import requests
 from botocore.config import Config
 from playwright.async_api import async_playwright
 
@@ -18,7 +19,32 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "YOUR_R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "YOUR_R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "YOUR_R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "YOUR_R2_BUCKET_NAME")
-CUSTOM_STREAM_DOMAIN = os.getenv("CUSTOM_STREAM_DOMAIN", "https://phyhunt.org")
+CUSTOM_STREAM_DOMAIN = os.getenv("CUSTOM_STREAM_DOMAIN", "https://phyhunt.org").rstrip("/")
+
+# Physics Hunters LMS: runs started by the site (repository_dispatch with video_id) report
+# their progress here, and the R2 link goes into the lecture when the class ends.
+# Manual runs (dashboard / workflow_dispatch) have no video_id and report nothing.
+PH_CALLBACK_URL = os.getenv("PH_CALLBACK_URL", "")
+PH_CALLBACK_TOKEN = os.getenv("PH_CALLBACK_TOKEN", "")
+PH_VIDEO_ID = os.getenv("PH_VIDEO_ID", "")
+RUN_URL = os.getenv("RUN_URL", "")
+
+
+def report(slug, state, **extra):
+    """state: waiting | live | no_live | failed | ended. Never raises."""
+    if not (PH_CALLBACK_URL and PH_CALLBACK_TOKEN and PH_VIDEO_ID):
+        return
+    body = {"video_id": PH_VIDEO_ID, "slug": slug, "state": state, "run_url": RUN_URL, **extra}
+    for attempt in range(5):
+        try:
+            r = requests.post(PH_CALLBACK_URL, json=body, timeout=15,
+                              headers={"Authorization": f"Bearer {PH_CALLBACK_TOKEN}"})
+            print(f"📨 PH callback {state}: HTTP {r.status_code}")
+            if r.status_code < 500:
+                return
+        except Exception as e:
+            print(f"⚠️ PH callback {state} failed: {e}")
+        time.sleep(5 * (attempt + 1))
 
 boto_config = Config(max_pool_connections=50, retries={'max_attempts': 3})
 s3 = boto3.client(
@@ -86,8 +112,8 @@ def r2_live_uploader(local_dir, r2_folder, stop_event):
             uploaded_ts_files.intersection_update(ts_files)
             time.sleep(0.5)
 
-async def get_streamyard_id(watch_url):
-    print(f"🚀 Launching Playwright Detector for Watch Link: {watch_url}")
+async def get_streamyard_id(watch_url, wait_min):
+    print(f"🚀 Launching Playwright Detector for Watch Link: {watch_url} (waiting up to {wait_min} min)")
     stream_id = None
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
@@ -109,10 +135,17 @@ async def get_streamyard_id(watch_url):
         except Exception:
             pass
 
-        retries = 900
-        while not stream_id and retries > 0:
+        deadline = time.time() + wait_min * 60
+        next_reload = time.time() + 300
+        while not stream_id and time.time() < deadline:
             await asyncio.sleep(2)
-            retries -= 1
+            # A watch page opened long before the broadcast may not switch to it by itself.
+            if not stream_id and time.time() >= next_reload:
+                next_reload = time.time() + 300
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    pass
         await browser.close()
         return stream_id
 
@@ -194,24 +227,51 @@ def process_live_stream(live_url, stream_slug):
     m3u8_files = [f for f in os.listdir(local_hls_dir) if f.endswith('.m3u8')]
     for m3u8 in m3u8_files:
         local_path = os.path.join(local_hls_dir, m3u8)
+        if m3u8 != "master.m3u8":
+            close_playlist(local_path)
         r2_key = f"{r2_folder}/{m3u8}"
         upload_to_r2(local_path, r2_key, 'application/vnd.apple.mpegurl', is_m3u8=True, is_final=True)
 
     print("✅ VOD Conversion Complete!")
+    return len([f for f in os.listdir(local_hls_dir) if f.endswith('.ts')])
+
+
+def close_playlist(path):
+    """A playlist left open by a crashed FFmpeg plays as live (from the end): mark it finished."""
+    with open(path) as f:
+        text = f.read()
+    text = text.replace("#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-PLAYLIST-TYPE:VOD")
+    if "#EXT-X-ENDLIST" not in text:
+        text = text.rstrip("\n") + "\n#EXT-X-ENDLIST\n"
+    with open(path, "w") as f:
+        f.write(text)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--slug", required=True)
+    parser.add_argument("--wait-min", type=float, default=30, help="minutes to wait for the broadcast to go live")
     args = parser.parse_args()
+    public_url = f"{CUSTOM_STREAM_DOMAIN}/live/{args.slug}/master.m3u8"
 
-    stream_id = asyncio.run(get_streamyard_id(args.url))
+    try:
+        report(args.slug, "waiting")
+        stream_id = asyncio.run(get_streamyard_id(args.url, args.wait_min))
 
-    if stream_id:
-        # Fixed Full Domain URL
-        fastly_m3u8_url = f"https://streamyard-video-delivery.global.ssl.fastly.net/live/{stream_id}/stream_720p.m3u8"
-        print(f"🎯 Target Acquired: {stream_id}")
-        print(f"📡 Transcoding URL: {fastly_m3u8_url}")
-        process_live_stream(fastly_m3u8_url, args.slug)
-    else:
-        print("❌ Stream ID পাওয়া যায়নি।")
+        if stream_id:
+            # Fixed Full Domain URL
+            fastly_m3u8_url = f"https://streamyard-video-delivery.global.ssl.fastly.net/live/{stream_id}/stream_720p.m3u8"
+            print(f"🎯 Target Acquired: {stream_id}")
+            print(f"📡 Transcoding URL: {fastly_m3u8_url}")
+            report(args.slug, "live", url=public_url)
+            segments = process_live_stream(fastly_m3u8_url, args.slug)
+            if segments:
+                report(args.slug, "ended", url=public_url, segments=segments)
+            else:
+                report(args.slug, "failed", error="FFmpeg could not record any segment")
+        else:
+            print("❌ Stream ID পাওয়া যায়নি।")
+            report(args.slug, "no_live")
+    except BaseException as e:
+        report(args.slug, "failed", error=f"{type(e).__name__}: {e}"[:300])
+        raise

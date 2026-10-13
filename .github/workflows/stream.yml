@@ -51,7 +51,25 @@ jobs:
           R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CUSTOM_STREAM_DOMAIN: ${{ secrets.CUSTOM_STREAM_DOMAIN }}
+          PH_CALLBACK_TOKEN: ${{ secrets.PH_CALLBACK_TOKEN }}
+          # Payload values go through env, never into the script text.
+          WATCH_URL: ${{ github.event.inputs.watch_url || github.event.client_payload.watch_url }}
+          STREAM_SLUG: ${{ github.event.inputs.stream_slug || github.event.client_payload.stream_slug }}
+          WAIT_MIN: ${{ github.event.client_payload.wait_min || '30' }}
+          PH_VIDEO_ID: ${{ github.event.client_payload.video_id }}
+          PH_CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python stream_mirror.py --url "$WATCH_URL" --slug "$STREAM_SLUG" --wait-min "$WAIT_MIN"
+
+      # Setup failed or the run was cancelled: tell the LMS so it can start another run.
+      - name: Report failure to Physics Hunters
+        if: ${{ (failure() || cancelled()) && github.event.client_payload.video_id != '' }}
+        env:
+          PH_CALLBACK_TOKEN: ${{ secrets.PH_CALLBACK_TOKEN }}
+          PH_CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          PH_VIDEO_ID: ${{ github.event.client_payload.video_id }}
+          STREAM_SLUG: ${{ github.event.client_payload.stream_slug }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          URL="${{ github.event.inputs.watch_url || github.event.client_payload.watch_url }}"
-          SLUG="${{ github.event.inputs.stream_slug || github.event.client_payload.stream_slug }}"
-          python stream_mirror.py --url "$URL" --slug "$SLUG"
+          python3 -c 'import json, os; print(json.dumps({"video_id": os.environ["PH_VIDEO_ID"], "slug": os.environ["STREAM_SLUG"], "state": "failed", "run_url": os.environ["RUN_URL"], "error": "workflow failed or was cancelled"}))' > body.json
+          curl -sS -m 20 -X POST "$PH_CALLBACK_URL" -H "Authorization: Bearer $PH_CALLBACK_TOKEN" -H "Content-Type: application/json" --data @body.json || true
